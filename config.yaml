@@ -1,0 +1,65 @@
+# RustBridge Configuration
+# This file configures the stratum bridge that connects miners to the Kaspa node
+
+# Stratum server port (format: ":PORT" or "HOST:PORT")
+# Miners will connect to this port
+# Using ":PORT" will bind to 0.0.0.0:PORT
+stratum_port: ":5555"
+
+# Kaspa node gRPC address (format: "HOST:PORT" or "grpc://HOST:PORT")
+# The bridge will connect to the Kaspa node at this address
+# Default HTTP gRPC port is typically 16110
+# Use 127.0.0.1 instead of localhost to force IPv4
+kaspad_address: "127.0.0.1:16110"
+
+# Prometheus metrics server port (format: ":PORT" or "HOST:PORT")
+# Metrics will be available at http://HOST:PORT/metrics
+# Using ":PORT" will bind to 0.0.0.0:PORT
+prom_port: ":2114"
+
+# Print statistics to console
+print_stats: true
+
+# Log to file (if true, logs will be written to a file)
+log_to_file: true
+
+# Health check server port (optional, leave empty to disable)
+# Health check endpoint will respond with HTTP 200 OK
+health_check_port: ""
+
+# Minimum share difficulty
+# Lower values allow weaker shares, higher values require stronger shares
+# For IceRiver ASICs, 4096 or 2048 may work better than 8192
+min_share_diff: 4096
+
+# Enable variable difficulty adjustment
+# Automatically adjusts difficulty based on miner performance
+var_diff: true
+
+# Target shares per minute for variable difficulty
+# Used to calculate optimal difficulty for each miner
+shares_per_min: 20
+
+# Enable variable difficulty statistics logging
+var_diff_stats: false
+
+# Block template wait time in milliseconds
+# How long to wait between checking for new block templates
+# Default: 1000ms (1 second)
+block_wait_time: 1000
+
+# Extranonce size in bytes (0-3)
+# NOTE: This value is now AUTO-DETECTED per client based on miner type
+# - Bitmain (GodMiner): automatically uses extranonce_size = 0
+# - IceRiver/BzMiner/Goldshell: automatically uses extranonce_size = 2
+# This config value is OPTIONAL and completely ignored - you can:
+#   - Remove this line entirely (recommended)
+#   - Comment it out (as shown below)
+#   - Set it to any value (0, 2, etc.) - it will be ignored regardless
+# The bridge will automatically detect the miner type from mining.subscribe and assign the correct extranonce
+# extranonce_size: 2  # Optional - auto-detected, can be removed or commented out
+
+# Enable power-of-2 difficulty clamping
+# Clamps difficulty to nearest power of 2 for compatibility
+pow2_clamp: true
+
