@@ -156,6 +156,7 @@ pub struct ShareHandler {
     stats: Arc<Mutex<HashMap<String, WorkStats>>>,
     overall: Arc<WorkStats>,
     instance_id: String,  // Instance identifier for logging
+    target_spm: Arc<Mutex<Option<f64>>>,
 }
 
 impl ShareHandler {
@@ -165,11 +166,16 @@ impl ShareHandler {
             stats: Arc::new(Mutex::new(HashMap::new())),
             overall: Arc::new(WorkStats::new("overall".to_string())),
             instance_id,
+            target_spm: Arc::new(Mutex::new(None)),
         }
     }
     
     fn log_prefix(&self) -> String {
         format!("[{}]", self.instance_id)
+    }
+
+    pub fn set_target_spm(&self, spm: f64) {
+        *self.target_spm.lock() = Some(spm);
     }
 
     pub fn get_create_stats(&self, ctx: &StratumContext) -> WorkStats {
@@ -811,12 +817,15 @@ impl ShareHandler {
         let stats = Arc::clone(&self.stats);
         let overall = Arc::clone(&self.overall);
         let prefix = self.log_prefix();
+        let target_spm = Arc::clone(&self.target_spm);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(STATS_PRINT_INTERVAL);
             let start = Instant::now();
             loop {
                 interval.tick().await;
                 
+                let now = Instant::now();
+                let target_spm_val = *target_spm.lock();
                 let stats_map = stats.lock();
                 let mut lines = Vec::new();
                 let mut total_rate = 0.0;
@@ -839,10 +848,63 @@ impl ShareHandler {
                     let invalids = *v.invalid_shares.lock();
                     let blocks = *v.blocks_found.lock();
                     let uptime = format!("{:?}", v.start_time.elapsed());
+                    let diff = *v.min_diff.lock();
+
+                    let (spm, window_secs) = match *v.var_diff_start_time.lock() {
+                        Some(start_window) => {
+                            let window_elapsed = now.duration_since(start_window).as_secs_f64().max(0.0);
+                            let window_shares = *v.var_diff_shares_found.lock() as f64;
+                            let spm_val = if window_elapsed > 0.0 {
+                                (window_shares / window_elapsed) * 60.0
+                            } else {
+                                0.0
+                            };
+                            (spm_val, window_elapsed)
+                        }
+                        None => (0.0, 0.0),
+                    };
+
+                    let (trend, status) = if let Some(target) = target_spm_val {
+                        if window_secs == 0.0 {
+                            ("-", "warmup")
+                        } else if target > 0.0 {
+                            let ratio = spm / target;
+                            if ratio > VARDIFF_UPPER_RATIO {
+                                ("up", "vardiff")
+                            } else if ratio < VARDIFF_LOWER_RATIO {
+                                ("down", "vardiff")
+                            } else {
+                                ("flat", "vardiff")
+                            }
+                        } else {
+                            ("-", "vardiff")
+                        }
+                    } else {
+                        ("-", "fixed")
+                    };
+
+                    let worker_name = &*v.worker_name.lock();
+                    let diff_str = if diff > 0.0 { format!("{:.0}", diff) } else { "-".to_string() };
+                    let spm_str = if target_spm_val.is_some() && window_secs > 0.0 {
+                        format!("{:.1}", spm)
+                    } else {
+                        "-".to_string()
+                    };
+                    let target_str = if let Some(target) = target_spm_val {
+                        format!("{:.1}", target)
+                    } else {
+                        "-".to_string()
+                    };
+
                     lines.push(format!(
-                        " {:<22}| {:>14} | {:>13} | {:>6} | {:>11}",
-                        &*v.worker_name.lock(),
+                        " {:<22}| {:>14} | {:>8} | {:>6} | {:>7} | {:>7} | {:>7} | {:>13} | {:>6} | {:>11}",
+                        worker_name,
                         format_hashrate(rate),
+                        diff_str,
+                        spm_str,
+                        target_str,
+                        trend,
+                        status,
                         format!("{}/{}/{}", shares, stales, invalids),
                         blocks,
                         uptime
@@ -852,10 +914,15 @@ impl ShareHandler {
                 lines.sort();
                 drop(stats_map);
                 
-                info!("{} \n===============================================================================\n      worker name      |  avg hashrate  |  acc/stl/inv  | blocks |    uptime   \n-------------------------------------------------------------------------------\n{}\n-------------------------------------------------------------------------------\n                       | {:>14} | {:>13} | {:>6} | {:>11}\n========================================================== RustBridge V.1 ===\n",
+                info!("{} \n===============================================================================\n      worker name      |  avg hashrate  |    diff |   spm |  target |  trend |  status |  acc/stl/inv  | blocks |    uptime   \n-------------------------------------------------------------------------------\n{}\n-------------------------------------------------------------------------------\n                       | {:>14} | {:>8} | {:>6} | {:>7} | {:>7} | {:>7} | {:>13} | {:>6} | {:>11}\n========================================================== RustBridge V.1 ===\n",
                     prefix,
                     lines.join("\n"),
                     format_hashrate(total_rate),
+                    "-",
+                    "-",
+                    if let Some(target) = target_spm_val { format!("{:.1}", target) } else { "-".to_string() },
+                    "-",
+                    if target_spm_val.is_some() { "vardiff".to_string() } else { "fixed".to_string() },
                     format!("{}/{}/{}", 
                         *overall.shares_found.lock(), 
                         *overall.stale_shares.lock(), 
