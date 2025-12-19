@@ -18,12 +18,102 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
+use crate::constants::{STATS_PRUNE_INTERVAL, STATS_PRINT_INTERVAL};
+
 #[allow(dead_code)]
 const VAR_DIFF_THREAD_SLEEP: u64 = 10;
 #[allow(dead_code)]
 const WORK_WINDOW: u64 = 80;
-const STATS_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
-const STATS_PRINT_INTERVAL: Duration = Duration::from_secs(10);
+
+// VarDiff tunables (kept conservative to avoid oscillation across miner brands)
+const VARDIFF_MIN_ELAPSED_SECS: f64 = 30.0;
+const VARDIFF_MAX_ELAPSED_SECS_NO_SHARES: f64 = 90.0;
+const VARDIFF_MIN_SHARES: f64 = 3.0;
+const VARDIFF_LOWER_RATIO: f64 = 0.75; // below this => decrease diff
+const VARDIFF_UPPER_RATIO: f64 = 1.25; // above this => increase diff
+const VARDIFF_MAX_STEP_UP: f64 = 2.0; // max 2x per adjustment tick
+const VARDIFF_MAX_STEP_DOWN: f64 = 0.5; // max -50% per adjustment tick
+
+fn vardiff_pow2_clamp_towards(current: f64, next: f64) -> f64 {
+    if !next.is_finite() || next <= 0.0 {
+        return 1.0;
+    }
+
+    // Keep updates monotonic when clamping:
+    // - If we are increasing (next >= current): clamp up to the next power-of-two (ceil).
+    // - If we are decreasing (next < current): clamp down to the previous power-of-two (floor).
+    let exp = if next >= current {
+        next.log2().ceil()
+    } else {
+        next.log2().floor()
+    };
+
+    let clamped = 2_f64.powi(exp as i32);
+    if clamped < 1.0 { 1.0 } else { clamped }
+}
+
+fn vardiff_compute_next_diff(
+    current: f64,
+    shares: f64,
+    elapsed_secs: f64,
+    expected_spm: f64,
+    clamp_pow2: bool,
+) -> Option<f64> {
+    if !current.is_finite() || current <= 0.0 {
+        return None;
+    }
+    if !elapsed_secs.is_finite() || elapsed_secs <= 0.0 {
+        return None;
+    }
+
+    // No shares fallback: if a miner stops submitting, we likely overshot difficulty.
+    if shares == 0.0 && elapsed_secs >= VARDIFF_MAX_ELAPSED_SECS_NO_SHARES {
+        let mut next = current * VARDIFF_MAX_STEP_DOWN;
+        if next < 1.0 {
+            next = 1.0;
+        }
+        if clamp_pow2 {
+            next = vardiff_pow2_clamp_towards(current, next);
+        }
+        return if next != current { Some(next) } else { None };
+    }
+
+    // Need enough observation time and data.
+    if elapsed_secs < VARDIFF_MIN_ELAPSED_SECS || shares < VARDIFF_MIN_SHARES {
+        return None;
+    }
+
+    let observed_spm = (shares / elapsed_secs) * 60.0;
+    let ratio = observed_spm / expected_spm.max(1.0);
+
+    if !(ratio.is_finite()) || ratio <= 0.0 {
+        return None;
+    }
+
+    // Only adjust when we’re meaningfully away from target.
+    if ratio > VARDIFF_LOWER_RATIO && ratio < VARDIFF_UPPER_RATIO {
+        return None;
+    }
+
+    // Dampen the adjustment to avoid oscillation: step = sqrt(ratio)
+    let step = ratio.sqrt().clamp(VARDIFF_MAX_STEP_DOWN, VARDIFF_MAX_STEP_UP);
+
+    let mut next = current * step;
+    if next < 1.0 {
+        next = 1.0;
+    }
+    if clamp_pow2 {
+        next = vardiff_pow2_clamp_towards(current, next);
+    }
+
+    // Avoid tiny churn updates.
+    let rel_change = (next - current).abs() / current.max(1.0);
+    if rel_change < 0.10 {
+        return None;
+    }
+
+    if next != current { Some(next) } else { None }
+}
 
 #[derive(Clone)]
 pub struct WorkStats {
@@ -66,6 +156,7 @@ pub struct ShareHandler {
     stats: Arc<Mutex<HashMap<String, WorkStats>>>,
     overall: Arc<WorkStats>,
     instance_id: String,  // Instance identifier for logging
+    target_spm: Arc<Mutex<Option<f64>>>,
 }
 
 impl ShareHandler {
@@ -75,11 +166,16 @@ impl ShareHandler {
             stats: Arc::new(Mutex::new(HashMap::new())),
             overall: Arc::new(WorkStats::new("overall".to_string())),
             instance_id,
+            target_spm: Arc::new(Mutex::new(None)),
         }
     }
     
     fn log_prefix(&self) -> String {
         format!("[{}]", self.instance_id)
+    }
+
+    pub fn set_target_spm(&self, spm: f64) {
+        *self.target_spm.lock() = Some(spm);
     }
 
     pub fn get_create_stats(&self, ctx: &StratumContext) -> WorkStats {
@@ -146,13 +242,13 @@ impl ShareHandler {
         }
         
         let prefix = self.log_prefix();
-        tracing::debug!("{} [SUBMIT] Params[0] (address/identity): {:?}", prefix, event.params.get(0));
+        tracing::debug!("{} [SUBMIT] Params[0] (address/identity): {:?}", prefix, event.params.first());
         tracing::debug!("{} [SUBMIT] Params[1] (job_id): {:?}", prefix, event.params.get(1));
         tracing::debug!("{} [SUBMIT] Params[2] (nonce): {:?}", prefix, event.params.get(2));
 
         // Optionally validate params[0] (address.name) if present
         // Some miners send it, others don't - we get address from authorize anyway
-        if let Some(Value::String(submitted_identity)) = event.params.get(0) {
+        if let Some(Value::String(submitted_identity)) = event.params.first() {
             let wallet_addr = ctx.wallet_addr.lock().clone();
             let _worker_name = ctx.worker_name.lock().clone();
             
@@ -341,23 +437,21 @@ impl ShareHandler {
             // Log at debug level (detailed validation logs moved to debug)
             if pow_passed {
                 tracing::debug!("{} {} {}", LogColors::validation("[VALIDATION]"), LogColors::block("*** NETWORK TARGET PASSED ***"), format!("pow_value={:x} <= network_target={:x}", pow_value, network_target));
-            } else {
-                if !network_target.is_zero() {
-                    let ratio = if !pow_value.is_zero() {
-                        let target_f64 = network_target.to_f64().unwrap_or(0.0);
-                        let pow_f64 = pow_value.to_f64().unwrap_or(1.0);
-                        if pow_f64 > 0.0 {
-                            (target_f64 / pow_f64) * 100.0
-                        } else {
-                            0.0
-                        }
+            } else if !network_target.is_zero() {
+                let ratio = if !pow_value.is_zero() {
+                    let target_f64 = network_target.to_f64().unwrap_or(0.0);
+                    let pow_f64 = pow_value.to_f64().unwrap_or(1.0);
+                    if pow_f64 > 0.0 {
+                        (target_f64 / pow_f64) * 100.0
                     } else {
                         0.0
-                    };
-                    tracing::debug!("{} {} {}", LogColors::validation("[VALIDATION]"), LogColors::label("Network target NOT met -"), format!("pow_value={:x} > network_target={:x} ({}% of target)", pow_value, network_target, ratio));
+                    }
                 } else {
-                    warn!("{} {}", LogColors::validation("[VALIDATION]"), LogColors::error("Network target is ZERO - cannot validate!"));
-                }
+                    0.0
+                };
+                tracing::debug!("{} {} {}", LogColors::validation("[VALIDATION]"), LogColors::label("Network target NOT met -"), format!("pow_value={:x} > network_target={:x} ({}% of target)", pow_value, network_target, ratio));
+            } else {
+                warn!("{} {}", LogColors::validation("[VALIDATION]"), LogColors::error("Network target is ZERO - cannot validate!"));
             }
 
             // Check network target (block)
@@ -527,7 +621,7 @@ impl ShareHandler {
             // Check pool difficulty
             let pool_target = state.stratum_diff()
                 .map(|d| d.target_value.clone())
-                .unwrap_or_else(|| BigUint::zero());
+                .unwrap_or_else(BigUint::zero);
             
             // Compare FULL pow_value against pool_target (not just lower bits)
             // Compare full 256-bit values
@@ -693,10 +787,10 @@ impl ShareHandler {
 
     pub fn start_client_vardiff(&self, ctx: &StratumContext) {
         let stats = self.get_create_stats(ctx);
-        if stats.var_diff_start_time.lock().is_none() {
-            *stats.var_diff_start_time.lock() = Some(Instant::now());
-            *stats.var_diff_shares_found.lock() = 0;
-        }
+        // Reset window (used after applying a new difficulty)
+        *stats.var_diff_start_time.lock() = Some(Instant::now());
+        *stats.var_diff_shares_found.lock() = 0;
+        *stats.var_diff_window.lock() = 0;
     }
 
     pub fn start_prune_stats_thread(&self) {
@@ -705,13 +799,14 @@ impl ShareHandler {
             let mut interval = tokio::time::interval(STATS_PRUNE_INTERVAL);
             loop {
                 interval.tick().await;
+                use crate::constants::{WORKER_INITIAL_GRACE_PERIOD, WORKER_INACTIVITY_TIMEOUT};
                 let mut stats_map = stats.lock();
                 let now = Instant::now();
                 stats_map.retain(|_, v| {
                     let last_share = *v.last_share.lock();
                     let shares = *v.shares_found.lock();
-                    (shares > 0 || now.duration_since(v.start_time) < Duration::from_secs(180))
-                        && now.duration_since(last_share) < Duration::from_secs(600)
+                    (shares > 0 || now.duration_since(v.start_time) < Duration::from_secs(WORKER_INITIAL_GRACE_PERIOD))
+                        && now.duration_since(last_share) < Duration::from_secs(WORKER_INACTIVITY_TIMEOUT)
                 });
                 // Note: Pruning is silent, no logs needed
             }
@@ -722,12 +817,15 @@ impl ShareHandler {
         let stats = Arc::clone(&self.stats);
         let overall = Arc::clone(&self.overall);
         let prefix = self.log_prefix();
+        let target_spm = Arc::clone(&self.target_spm);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(STATS_PRINT_INTERVAL);
             let start = Instant::now();
             loop {
                 interval.tick().await;
                 
+                let now = Instant::now();
+                let target_spm_val = *target_spm.lock();
                 let stats_map = stats.lock();
                 let mut lines = Vec::new();
                 let mut total_rate = 0.0;
@@ -749,11 +847,65 @@ impl ShareHandler {
                     let stales = *v.stale_shares.lock();
                     let invalids = *v.invalid_shares.lock();
                     let blocks = *v.blocks_found.lock();
-                    let uptime = format!("{:?}", v.start_time.elapsed());
+                    let uptime_secs = v.start_time.elapsed().as_secs_f64();
+                    let uptime = format!("{:.1}m", uptime_secs / 60.0);
+                    let diff = *v.min_diff.lock();
+
+                    let (spm, window_secs) = match *v.var_diff_start_time.lock() {
+                        Some(start_window) => {
+                            let window_elapsed = now.duration_since(start_window).as_secs_f64().max(0.0);
+                            let window_shares = *v.var_diff_shares_found.lock() as f64;
+                            let spm_val = if window_elapsed > 0.0 {
+                                (window_shares / window_elapsed) * 60.0
+                            } else {
+                                0.0
+                            };
+                            (spm_val, window_elapsed)
+                        }
+                        None => (0.0, 0.0),
+                    };
+
+                    let (trend, status) = if let Some(target) = target_spm_val {
+                        if window_secs == 0.0 {
+                            ("-", "warmup")
+                        } else if target > 0.0 {
+                            let ratio = spm / target;
+                            if ratio > VARDIFF_UPPER_RATIO {
+                                ("up", "vardiff")
+                            } else if ratio < VARDIFF_LOWER_RATIO {
+                                ("down", "vardiff")
+                            } else {
+                                ("flat", "vardiff")
+                            }
+                        } else {
+                            ("-", "vardiff")
+                        }
+                    } else {
+                        ("-", "fixed")
+                    };
+
+                    let worker_name = &*v.worker_name.lock();
+                    let diff_str = if diff > 0.0 { format!("{:.0}", diff) } else { "-".to_string() };
+                    let spm_str = if target_spm_val.is_some() && window_secs > 0.0 {
+                        format!("{:.1}", spm)
+                    } else {
+                        "-".to_string()
+                    };
+                    let target_str = if let Some(target) = target_spm_val {
+                        format!("{:.1}", target)
+                    } else {
+                        "-".to_string()
+                    };
+
                     lines.push(format!(
-                        " {:<22}| {:>14} | {:>13} | {:>6} | {:>11}",
-                        &*v.worker_name.lock(),
+                        " {:<22}| {:>14} | {:>8} | {:>6} | {:>7} | {:>7} | {:>7} | {:>13} | {:>6} | {:>11}",
+                        worker_name,
                         format_hashrate(rate),
+                        diff_str,
+                        spm_str,
+                        target_str,
+                        trend,
+                        status,
                         format!("{}/{}/{}", shares, stales, invalids),
                         blocks,
                         uptime
@@ -763,16 +915,24 @@ impl ShareHandler {
                 lines.sort();
                 drop(stats_map);
                 
-                info!("{} \n===============================================================================\n      worker name      |  avg hashrate  |  acc/stl/inv  | blocks |    uptime   \n-------------------------------------------------------------------------------\n{}\n-------------------------------------------------------------------------------\n                       | {:>14} | {:>13} | {:>6} | {:>11}\n========================================================== RustBridge V.1 ===\n",
+                info!("{} \n===============================================================================\n      worker name      |  avg hashrate  |    diff |   spm |  target |  trend |  status |  acc/stl/inv  | blocks |    uptime   \n-------------------------------------------------------------------------------\n{}\n-------------------------------------------------------------------------------\n                       | {:>14} | {:>8} | {:>6} | {:>7} | {:>7} | {:>7} | {:>13} | {:>6} | {:>11}\n========================================================== RustBridge V.1 ===\n",
                     prefix,
                     lines.join("\n"),
                     format_hashrate(total_rate),
+                    "-",
+                    "-",
+                    if let Some(target) = target_spm_val { format!("{:.1}", target) } else { "-".to_string() },
+                    "-",
+                    if target_spm_val.is_some() { "vardiff".to_string() } else { "fixed".to_string() },
                     format!("{}/{}/{}", 
                         *overall.shares_found.lock(), 
                         *overall.stale_shares.lock(), 
                         *overall.invalid_shares.lock()),
                     *overall.blocks_found.lock(),
-                    format!("{:?}", start.elapsed())
+                    {
+                        let overall_secs = start.elapsed().as_secs_f64();
+                        format!("{:.1}m", overall_secs / 60.0)
+                    }
                 );
             }
         });
@@ -780,13 +940,82 @@ impl ShareHandler {
 
     pub fn start_vardiff_thread(
         &self,
-        _expected_share_rate: u32,
-        _log_stats: bool,
-        _clamp: bool,
+        expected_share_rate: u32,
+        log_stats: bool,
+        clamp: bool,
     ) {
-        // TODO: Implement full vardiff logic
+        // VarDiff controller:
+        // - Uses accepted share rate per worker to converge towards `expected_share_rate` shares/minute
+        // - Adjusts difficulty smoothly (sqrt damping + max step per tick)
+        // - Optional pow2 clamp (matches startup clamp behavior)
+        let stats = Arc::clone(&self.stats);
         let prefix = self.log_prefix();
-        tracing::debug!("{} Vardiff thread started (simplified implementation)", prefix);
+
+        tokio::spawn(async move {
+            let expected_spm = expected_share_rate.max(1) as f64;
+            let mut interval = tokio::time::interval(Duration::from_secs(VAR_DIFF_THREAD_SLEEP));
+
+            if log_stats {
+                tracing::info!(
+                    "{} VarDiff enabled (target={} shares/min, tick={}s, pow2_clamp={})",
+                    prefix,
+                    expected_spm,
+                    VAR_DIFF_THREAD_SLEEP,
+                    clamp
+                );
+            } else {
+                tracing::debug!(
+                    "{} VarDiff thread started (target={} shares/min, tick={}s, pow2_clamp={})",
+                    prefix,
+                    expected_spm,
+                    VAR_DIFF_THREAD_SLEEP,
+                    clamp
+                );
+            }
+
+            loop {
+                interval.tick().await;
+
+                let mut stats_map = stats.lock();
+                let now = Instant::now();
+
+                for (_worker_id, v) in stats_map.iter_mut() {
+                    let start_opt = *v.var_diff_start_time.lock();
+                    let Some(start) = start_opt else {
+                        continue;
+                    };
+
+                    let elapsed = now.duration_since(start).as_secs_f64().max(0.0);
+                    let shares = *v.var_diff_shares_found.lock() as f64;
+                    let current = *v.min_diff.lock();
+                    let next_opt = vardiff_compute_next_diff(current, shares, elapsed, expected_spm, clamp);
+                    let Some(next) = next_opt else {
+                        continue;
+                    };
+
+                    // Update the stored target difficulty, then reset the observation window so we
+                    // don't repeatedly adjust before the miner actually receives the new diff.
+                    *v.min_diff.lock() = next;
+                    *v.var_diff_start_time.lock() = Some(now);
+                    *v.var_diff_shares_found.lock() = 0;
+                    *v.var_diff_window.lock() = 0;
+
+                    if log_stats {
+                        let observed_spm = if elapsed > 0.0 { (shares / elapsed) * 60.0 } else { 0.0 };
+                        tracing::info!(
+                            "{} VarDiff: {:.1} spm (target {:.1}), shares={}, window={:.0}s, diff {:.0} -> {:.0}",
+                            prefix,
+                            observed_spm,
+                            expected_spm,
+                            shares as i64,
+                            elapsed,
+                            current,
+                            next
+                        );
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -826,5 +1055,54 @@ pub trait KaspaApiTrait: Send + Sync {
 pub struct WorkerContext<'a> {
     pub worker_name: &'a str,
     pub wallet_addr: &'a str,
+}
+
+#[cfg(test)]
+mod vardiff_tests {
+    use super::*;
+
+    // These tests validate that VarDiff captures the key information it needs:
+    // - accepted share count over a time window
+    // - current diff
+    // and produces stable, bounded diff updates (independent of ASIC model identity).
+
+    #[test]
+    fn vardiff_increases_diff_when_share_rate_is_high() {
+        // current=8192, observed=100 spm, target=20 spm -> ratio=5 -> sqrt(ratio)=2.236 -> clamped to 2x
+        let next = vardiff_compute_next_diff(8192.0, 100.0, 60.0, 20.0, false);
+        assert_eq!(next, Some(16384.0));
+    }
+
+    #[test]
+    fn vardiff_decreases_diff_when_share_rate_is_low() {
+        // current=8192, observed=2.5 spm, target=20 spm -> ratio=0.125 -> sqrt=0.353 -> clamped to 0.5x
+        let next = vardiff_compute_next_diff(8192.0, 5.0, 120.0, 20.0, false);
+        assert_eq!(next, Some(4096.0));
+    }
+
+    #[test]
+    fn vardiff_no_change_when_within_target_band() {
+        // Exactly at target: should not recommend change.
+        let next = vardiff_compute_next_diff(8192.0, 20.0, 60.0, 20.0, false);
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn vardiff_decreases_diff_when_no_shares_timeout() {
+        // No accepted shares for long enough => drop diff by 50% to recover submissions.
+        let next = vardiff_compute_next_diff(8192.0, 0.0, 100.0, 20.0, false);
+        assert_eq!(next, Some(4096.0));
+    }
+
+    #[test]
+    fn vardiff_pow2_clamp_should_not_reverse_direction_on_increase() {
+        // If pow2 clamp floors unconditionally, it can accidentally *lower* difficulty on an increase.
+        // Example: current=5000, next_suggested=7500 -> we must clamp UP (8192), not DOWN (4096).
+        //
+        // Choose shares/elapsed such that next_suggested = 5000 * 1.5 = 7500:
+        // step = sqrt(ratio) => ratio = 2.25 => observed_spm = 45 (if target=20)
+        let next = vardiff_compute_next_diff(5000.0, 45.0, 60.0, 20.0, true);
+        assert_eq!(next, Some(8192.0));
+    }
 }
 
