@@ -145,10 +145,11 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Update Docker Hub Description
+        if: success() && github.event_name == 'release'
         uses: peter-evans/dockerhub-description@v5
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-          short-description: ${{ github.event.repository.description }}
           repository: kkluster/rusty-kaspa-stratum
           readme-filepath: ./README.md
+          short-description: "Rust implementation of Kaspa Stratum server"
